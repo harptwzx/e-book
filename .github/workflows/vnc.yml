@@ -4,41 +4,66 @@ on: workflow_dispatch
 jobs:
   vnc-desktop:
     runs-on: ubuntu-22.04
-    timeout-minutes: 360  # 延长到6小时
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ========== 1. 安装 Python 3.10 ==========
-      - name: Setup Python 3.10
-        run: |
-          python3 --version
-          python3 -m pip install --upgrade "pip==21.3.1"
-
-      # ========== 2. 安装桌面环境 ==========
-      - name: Install dependencies
+      # ========== 1. 安装完整桌面依赖 ==========
+      - name: Install desktop environment
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            openbox obconf \
-            lxpanel pcmanfm \
-            xterm \
+            ubuntu-mate-core ubuntu-mate-desktop \
             tigervnc-standalone-server \
-            xfonts-base xfonts-75dpi xfonts-100dpi \
-            fontconfig \
-            autocutsel \
+            dbus-x11 \
+            xfce4-terminal \
             curl wget
+          # 清理冲突进程
+          sudo pkill -9 Xvnc 2>/dev/null || true
 
-      # ========== 3. 配置 VNC ==========
+      # ========== 2. 配置 VNC 密码和启动脚本 ==========
       - name: Setup VNC
         run: |
           mkdir -p ~/.vnc
           echo "github" | vncpasswd -f > ~/.vnc/passwd
           chmod 600 ~/.vnc/passwd
-          touch ~/.Xauthority
+          
+          # 创建稳定的 xstartup
+          cat > ~/.vnc/xstartup << 'EOF'
+          #!/bin/bash
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+          
+          # 启动 dbus
+          dbus-launch --exit-with-session &
+          
+          # 启动 MATE 桌面
+          mate-session &
+          
+          # 备用终端（如果MATE崩溃）
+          xfce4-terminal &
+          EOF
+          chmod +x ~/.vnc/xstartup
 
-      # ========== 4. 启动 bore.pub 隧道（独立运行）==========
+      # ========== 3. 启动 VNC（单次，稳定模式）==========
+      - name: Start VNC server
+        run: |
+          vncserver -kill :1 2>/dev/null || true
+          rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
+          vncserver :1 -geometry 1280x720 -depth 24 -localhost no
+          sleep 5
+          
+          # 验证 VNC 是否运行
+          if pgrep -f "Xvnc.*:1" > /dev/null; then
+            echo "VNC 启动成功"
+          else
+            echo "VNC 启动失败"
+            exit 1
+          fi
+
+      # ========== 4. 启动 bore.pub 隧道 ==========
       - name: Start bore tunnel
         run: |
           curl -sL https://api.github.com/repos/ekzhang/bore/releases/latest | \
@@ -47,111 +72,101 @@ jobs:
           tar -xzf bore.tar.gz
           chmod +x bore
           
-          # bore 单独后台运行，不依赖 VNC 状态
-          nohup ./bore local 5901 --to bore.pub > bore.log 2>&1 &
-          sleep 3
-
-      # ========== 5. 启动看门狗（自动重启 VNC + 桌面）==========
-      - name: Start watchdog for VNC and Desktop
-        run: |
-          cat > /tmp/watchdog.sh << 'EOF'
+          # 保持连接的长运行脚本
+          cat > keep_bore.sh << 'KEEP'
           #!/bin/bash
-          
-          VNC_DISPLAY=":1"
-          BORE_LOG="/home/runner/work/actions-vnc/bore.log"
-          
-          start_vnc() {
-              echo "[Watchdog] 启动 VNC Server..."
-              vncserver -kill $VNC_DISPLAY 2>/dev/null || true
-              rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
-              vncserver $VNC_DISPLAY -geometry 1280x720 -depth 24 -localhost no -xstartup /usr/bin/openbox-session
-              sleep 2
-          }
-          
-          start_desktop_components() {
-              echo "[Watchdog] 启动桌面组件..."
-              DISPLAY=$VNC_DISPLAY lxpanel &
-              DISPLAY=$VNC_DISPLAY pcmanfm --desktop &
-          }
-          
-          # 初始启动
-          start_vnc
-          start_desktop_components
-          
-          # 监控循环
           while true; do
-              # 检查 VNC 进程
-              if ! pgrep -f "Xvnc.*$VNC_DISPLAY" > /dev/null; then
-                  echo "[Watchdog] VNC 未运行，重启中..."
-                  start_vnc
-                  start_desktop_components
-              fi
-              
-              # 检查桌面组件
-              if ! pgrep "lxpanel" > /dev/null; then
-                  echo "[Watchdog] lxpanel 未运行，重启..."
-                  DISPLAY=$VNC_DISPLAY lxpanel &
-              fi
-              
-              if ! pgrep "pcmanfm" > /dev/null; then
-                  echo "[Watchdog] pcmanfm 未运行，重启..."
-                  DISPLAY=$VNC_DISPLAY pcmanfm --desktop &
-              fi
-              
-              # 打印连接信息
-              BORE_PORT=$(grep -oP 'listening at bore.pub:\K\d+' $BORE_LOG 2>/dev/null | head -1)
-              clear
-              echo ""
-              echo "╔════════════════════════════════════════════════════════════╗"
-              echo "║                    🖥️  VNC 连接信息                         ║"
-              echo "╠════════════════════════════════════════════════════════════╣"
-              if [ -n "$BORE_PORT" ]; then
-                echo "║  地址: bore.pub:${BORE_PORT}                                 ║"
-              else
-                echo "║  地址: 等待 bore 隧道启动中...                            ║"
-              fi
-              echo "║  密码: github                                              ║"
-              echo "╚════════════════════════════════════════════════════════════╝"
-              echo ""
-              echo "✅ 看门狗运行中，每 15 秒检查一次服务状态"
-              echo "🔒 VNC 或桌面组件崩溃后会自动重启"
-              echo ""
-              
-              sleep 15
+            ./bore local 5901 --to bore.pub > bore.log 2>&1
+            echo "bore 断开，5秒后重连..." >> bore.log
+            sleep 5
           done
-          EOF
-          
-          chmod +x /tmp/watchdog.sh
-          nohup /tmp/watchdog.sh > watchdog.log 2>&1 &
-          sleep 3
+          KEEP
+          chmod +x keep_bore.sh
+          nohup ./keep_bore.sh > /dev/null 2>&1 &
+          sleep 5
 
-      # ========== 6. 启动 tmate（后台模式）==========
-      - name: Start tmate in background
+      # ========== 5. 监控并自动修复 VNC ==========
+      - name: Watchdog for VNC
+        run: |
+          cat > watchdog.sh << 'WATCH'
+          #!/bin/bash
+          while true; do
+            # 检查 VNC 进程
+            if ! pgrep -f "Xvnc.*:1" > /dev/null; then
+              echo "[$(date)] VNC 崩溃，重启中..." >> /tmp/vnc_watchdog.log
+              vncserver -kill :1 2>/dev/null
+              rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
+              vncserver :1 -geometry 1280x720 -depth 24 -localhost no
+              sleep 5
+            fi
+            
+            # 检查桌面会话
+            if ! pgrep "mate-session" > /dev/null && ! pgrep "openbox" > /dev/null; then
+              echo "[$(date)] 桌面会话崩溃，重启 VNC..." >> /tmp/vnc_watchdog.log
+              vncserver -kill :1 2>/dev/null
+              sleep 2
+              rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
+              vncserver :1 -geometry 1280x720 -depth 24 -localhost no
+              sleep 5
+            fi
+            
+            sleep 10
+          done
+          WATCH
+          chmod +x watchdog.sh
+          nohup ./watchdog.sh > /dev/null 2>&1 &
+
+      # ========== 6. 获取并打印连接信息 ==========
+      - name: Print connection info
+        run: |
+          # 等待 bore 获取端口
+          sleep 8
+          BORE_PORT=$(grep -oP 'listening at bore.pub:\K\d+' bore.log 2>/dev/null | head -1)
+          
+          # 如果还没获取到，等待最多30秒
+          for i in {1..6}; do
+            if [ -n "$BORE_PORT" ]; then
+              break
+            fi
+            sleep 5
+            BORE_PORT=$(grep -oP 'listening at bore.pub:\K\d+' bore.log 2>/dev/null | head -1)
+          done
+          
+          echo ""
+          echo "╔════════════════════════════════════════════════════════════╗"
+          echo "║                    🖥️  VNC 连接信息                         ║"
+          echo "╠════════════════════════════════════════════════════════════╣"
+          echo "║  地址: bore.pub:${BORE_PORT:-未获取到，请查看日志}          ║"
+          echo "║  密码: github                                              ║"
+          echo "╠════════════════════════════════════════════════════════════╣"
+          echo "║  ⚠️  如果连接失败，等待30秒后重试                           ║"
+          echo "║  🔄 自动修复机制已启用，崩溃后会自动重启                    ║"
+          echo "╚════════════════════════════════════════════════════════════╝"
+          echo ""
+
+      # ========== 7. 后台 tmate ==========
+      - name: Start tmate
         uses: mxschmitt/action-tmate@v3
         with:
           detached: true
           limit-access-to-actor: true
 
-      # ========== 7. 保持工作流运行 ==========
-      - name: Keep alive
+      # ========== 8. 持续保活 ==========
+      - name: Keep workflow alive
         run: |
-          echo "所有服务已启动，看门狗正在监控..."
-          echo "SSH 链接在上面步骤已打印"
-          echo ""
-          
-          # 每 30 秒打印一次隧道端口
+          echo "服务运行中，看门狗已启动..."
+          echo "每30秒打印一次状态"
           while true; do
-            BORE_PORT=$(grep -oP 'listening at bore.pub:\K\d+' bore.log 2>/dev/null | head -1)
-            echo "[$(date '+%H:%M:%S')] VNC 隧道端口: ${BORE_PORT:-等待中}"
+            BORE_PORT=$(grep -oP 'listening at bore.pub:\K\d+' bore.log 2>/dev/null | tail -1)
+            VNC_STATUS=$(pgrep -f "Xvnc.*:1" > /dev/null && echo "✅ 运行中" || echo "❌ 已崩溃")
+            echo "[$(date '+%H:%M:%S')] VNC: $VNC_STATUS | 端口: ${BORE_PORT:-等待中}"
             sleep 30
           done
 
-      # ========== 8. 清理 ==========
+      # ========== 9. 清理 ==========
       - name: Cleanup
         if: always()
         run: |
-          echo "正在清理所有服务..."
-          pkill -f watchdog.sh || true
           vncserver -kill :1 2>/dev/null || true
-          pkill -f bore || true
-          pkill lxpanel pcmanfm || true
+          pkill -f bore 2>/dev/null || true
+          pkill -f watchdog.sh 2>/dev/null || true
