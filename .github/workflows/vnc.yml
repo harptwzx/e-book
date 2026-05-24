@@ -10,60 +10,69 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ========== 1. 安装完整桌面依赖 ==========
-      - name: Install desktop environment
+      # ========== 1. 安装最简桌面（~50MB）==========
+      - name: Install minimal X11
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            ubuntu-mate-core ubuntu-mate-desktop \
+            xorg \
+            openbox \
+            xterm \
             tigervnc-standalone-server \
-            dbus-x11 \
-            xfce4-terminal \
-            curl wget
-          # 清理冲突进程
-          sudo pkill -9 Xvnc 2>/dev/null || true
+            curl wget \
+            tint2  # 轻量任务栏
+          
+          # 清理 apt 缓存减少空间占用
+          sudo apt-get clean
 
-      # ========== 2. 配置 VNC 密码和启动脚本 ==========
+      # ========== 2. 配置 VNC ==========
       - name: Setup VNC
         run: |
           mkdir -p ~/.vnc
           echo "github" | vncpasswd -f > ~/.vnc/passwd
           chmod 600 ~/.vnc/passwd
           
-          # 创建稳定的 xstartup
+          # 最简 xstartup - 只启动 openbox + xterm
           cat > ~/.vnc/xstartup << 'EOF'
           #!/bin/bash
-          unset SESSION_MANAGER
-          unset DBUS_SESSION_BUS_ADDRESS
+          xrdb $HOME/.Xresources
           
-          # 启动 dbus
-          dbus-launch --exit-with-session &
+          # 启动轻量任务栏
+          tint2 &
           
-          # 启动 MATE 桌面
-          mate-session &
+          # 启动 openbox
+          openbox-session &
           
-          # 备用终端（如果MATE崩溃）
-          xfce4-terminal &
+          # 打开一个终端窗口
+          xterm -geometry 80x24+10+10 &
+          
+          # 保持会话运行
+          while true; do
+            sleep 10
+          done
           EOF
           chmod +x ~/.vnc/xstartup
 
-      # ========== 3. 启动 VNC（单次，稳定模式）==========
-      - name: Start VNC server
+      # ========== 3. 启动 VNC ==========
+      - name: Start VNC
         run: |
+          # 清理残留
           vncserver -kill :1 2>/dev/null || true
-          rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
-          vncserver :1 -geometry 1280x720 -depth 24 -localhost no
-          sleep 5
+          rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1 ~/.vnc/*.log
           
-          # 验证 VNC 是否运行
+          # 启动 VNC
+          vncserver :1 -geometry 1280x720 -depth 16 -localhost no
+          sleep 3
+          
+          # 验证
           if pgrep -f "Xvnc.*:1" > /dev/null; then
-            echo "VNC 启动成功"
+            echo "✅ VNC 启动成功"
           else
-            echo "VNC 启动失败"
+            echo "❌ VNC 启动失败"
             exit 1
           fi
 
-      # ========== 4. 启动 bore.pub 隧道 ==========
+      # ========== 4. 启动 bore.pub（带自动重连）==========
       - name: Start bore tunnel
         run: |
           curl -sL https://api.github.com/repos/ekzhang/bore/releases/latest | \
@@ -72,101 +81,102 @@ jobs:
           tar -xzf bore.tar.gz
           chmod +x bore
           
-          # 保持连接的长运行脚本
-          cat > keep_bore.sh << 'KEEP'
+          # 自动重连脚本
+          cat > bore_loop.sh << 'EOF'
           #!/bin/bash
           while true; do
-            ./bore local 5901 --to bore.pub > bore.log 2>&1
-            echo "bore 断开，5秒后重连..." >> bore.log
-            sleep 5
+            ./bore local 5901 --to bore.pub 2>&1 | tee -a bore.log
+            echo "[$(date)] bore 断开，3秒后重连..." | tee -a bore.log
+            sleep 3
           done
-          KEEP
-          chmod +x keep_bore.sh
-          nohup ./keep_bore.sh > /dev/null 2>&1 &
+          EOF
+          chmod +x bore_loop.sh
+          nohup ./bore_loop.sh > /dev/null 2>&1 &
           sleep 5
 
-      # ========== 5. 监控并自动修复 VNC ==========
-      - name: Watchdog for VNC
+      # ========== 5. 轻量看门狗 ==========
+      - name: Lightweight watchdog
         run: |
-          cat > watchdog.sh << 'WATCH'
+          cat > simple_watchdog.sh << 'EOF'
           #!/bin/bash
           while true; do
-            # 检查 VNC 进程
+            # 只检查 VNC 进程
             if ! pgrep -f "Xvnc.*:1" > /dev/null; then
-              echo "[$(date)] VNC 崩溃，重启中..." >> /tmp/vnc_watchdog.log
-              vncserver -kill :1 2>/dev/null
-              rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
-              vncserver :1 -geometry 1280x720 -depth 24 -localhost no
-              sleep 5
-            fi
-            
-            # 检查桌面会话
-            if ! pgrep "mate-session" > /dev/null && ! pgrep "openbox" > /dev/null; then
-              echo "[$(date)] 桌面会话崩溃，重启 VNC..." >> /tmp/vnc_watchdog.log
+              echo "[$(date)] VNC 崩溃，重启中..." >> /tmp/vnc_restart.log
               vncserver -kill :1 2>/dev/null
               sleep 2
               rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
-              vncserver :1 -geometry 1280x720 -depth 24 -localhost no
-              sleep 5
+              vncserver :1 -geometry 1280x720 -depth 16 -localhost no
+              sleep 3
             fi
-            
-            sleep 10
+            sleep 15
           done
-          WATCH
-          chmod +x watchdog.sh
-          nohup ./watchdog.sh > /dev/null 2>&1 &
+          EOF
+          chmod +x simple_watchdog.sh
+          nohup ./simple_watchdog.sh > /dev/null 2>&1 &
 
-      # ========== 6. 获取并打印连接信息 ==========
-      - name: Print connection info
+      # ========== 6. 打印连接信息 ==========
+      - name: Print VNC info
         run: |
-          # 等待 bore 获取端口
           sleep 8
           BORE_PORT=$(grep -oP 'listening at bore.pub:\K\d+' bore.log 2>/dev/null | head -1)
-          
-          # 如果还没获取到，等待最多30秒
-          for i in {1..6}; do
-            if [ -n "$BORE_PORT" ]; then
-              break
-            fi
-            sleep 5
-            BORE_PORT=$(grep -oP 'listening at bore.pub:\K\d+' bore.log 2>/dev/null | head -1)
-          done
           
           echo ""
           echo "╔════════════════════════════════════════════════════════════╗"
           echo "║                    🖥️  VNC 连接信息                         ║"
           echo "╠════════════════════════════════════════════════════════════╣"
-          echo "║  地址: bore.pub:${BORE_PORT:-未获取到，请查看日志}          ║"
+          echo "║  地址: bore.pub:${BORE_PORT:-等待中}                        ║"
           echo "║  密码: github                                              ║"
-          echo "╠════════════════════════════════════════════════════════════╣"
-          echo "║  ⚠️  如果连接失败，等待30秒后重试                           ║"
-          echo "║  🔄 自动修复机制已启用，崩溃后会自动重启                    ║"
           echo "╚════════════════════════════════════════════════════════════╝"
           echo ""
+          echo "💡 提示: 连接后你会看到 openbox 桌面 + xterm 终端"
+          echo "🔄 自动修复: VNC 崩溃后 15 秒内自动重启"
 
-      # ========== 7. 后台 tmate ==========
+      # ========== 7. tmate 后台 ==========
       - name: Start tmate
         uses: mxschmitt/action-tmate@v3
         with:
           detached: true
           limit-access-to-actor: true
 
-      # ========== 8. 持续保活 ==========
-      - name: Keep workflow alive
+      # ========== 8. 保活循环 ==========
+      - name: Keep alive
         run: |
-          echo "服务运行中，看门狗已启动..."
-          echo "每30秒打印一次状态"
+          echo "服务运行中，按 Ctrl+C 或取消工作流即可停止"
+          echo "所有数据会在工作流结束后自动清理"
+          echo ""
+          
           while true; do
             BORE_PORT=$(grep -oP 'listening at bore.pub:\K\d+' bore.log 2>/dev/null | tail -1)
-            VNC_STATUS=$(pgrep -f "Xvnc.*:1" > /dev/null && echo "✅ 运行中" || echo "❌ 已崩溃")
-            echo "[$(date '+%H:%M:%S')] VNC: $VNC_STATUS | 端口: ${BORE_PORT:-等待中}"
+            VNC_OK=$(pgrep -f "Xvnc.*:1" > /dev/null && echo "✅" || echo "❌")
+            echo "[$(date '+%H:%M:%S')] VNC: $VNC_OK | bore.pub:${BORE_PORT:------}"
             sleep 30
           done
 
-      # ========== 9. 清理 ==========
-      - name: Cleanup
-        if: always()
+      # ========== 9. 完整清理（工作流结束时自动执行）==========
+      - name: Cleanup everything
+        if: always()  # 无论成功/失败/取消都会执行
         run: |
+          echo "🧹 开始清理所有数据和缓存..."
+          
+          # 停止所有服务
           vncserver -kill :1 2>/dev/null || true
-          pkill -f bore 2>/dev/null || true
-          pkill -f watchdog.sh 2>/dev/null || true
+          pkill -f "bore" 2>/dev/null || true
+          pkill -f "watchdog" 2>/dev/null || true
+          pkill -f "openbox" 2>/dev/null || true
+          pkill -f "tint2" 2>/dev/null || true
+          
+          # 删除 VNC 临时文件
+          rm -rf /tmp/.X1* /tmp/.X11-unix/X1 2>/dev/null || true
+          rm -rf ~/.vnc/*.log ~/.vnc/*.pid 2>/dev/null || true
+          
+          # 删除 bore 和脚本
+          rm -f bore bore.tar.gz bore_loop.sh simple_watchdog.sh 2>/dev/null || true
+          
+          # 清理 home 目录的临时文件
+          rm -rf ~/.cache ~/.local/share/Trash 2>/dev/null || true
+          
+          # 清理 apt 缓存（可选，省空间）
+          sudo apt-get clean 2>/dev/null || true
+          
+          echo "✅ 清理完成，所有数据已删除"
