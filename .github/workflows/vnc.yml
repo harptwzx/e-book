@@ -20,9 +20,8 @@ jobs:
             xterm \
             tigervnc-standalone-server \
             curl wget \
-            tint2  # 轻量任务栏
+            tint2
           
-          # 清理 apt 缓存减少空间占用
           sudo apt-get clean
 
       # ========== 2. 配置 VNC ==========
@@ -32,43 +31,40 @@ jobs:
           echo "github" | vncpasswd -f > ~/.vnc/passwd
           chmod 600 ~/.vnc/passwd
           
-          # 最简 xstartup - 只启动 openbox + xterm
           cat > ~/.vnc/xstartup << 'EOF'
           #!/bin/bash
           xrdb $HOME/.Xresources
-          
-          # 启动轻量任务栏
           tint2 &
-          
-          # 启动 openbox
           openbox-session &
-          
-          # 打开一个终端窗口
           xterm -geometry 80x24+10+10 &
-          
-          # 保持会话运行
           while true; do
             sleep 10
           done
           EOF
           chmod +x ~/.vnc/xstartup
 
-      # ========== 3. 启动 VNC ==========
+      # ========== 3. 启动 VNC（修复进程检测）==========
       - name: Start VNC
         run: |
           # 清理残留
           vncserver -kill :1 2>/dev/null || true
           rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1 ~/.vnc/*.log
           
+          # 创建 .Xauthority 文件
+          touch ~/.Xauthority
+          
           # 启动 VNC
           vncserver :1 -geometry 1280x720 -depth 16 -localhost no
           sleep 3
           
-          # 验证
-          if pgrep -f "Xvnc.*:1" > /dev/null; then
+          # 修复：检测 Xtigervnc 或 Xvnc
+          if pgrep -f "Xtigervnc.*:1" > /dev/null || pgrep -f "Xvnc.*:1" > /dev/null; then
             echo "✅ VNC 启动成功"
+            vncserver -list
           else
             echo "❌ VNC 启动失败"
+            echo "当前 VNC 相关进程："
+            ps aux | grep -i vnc | grep -v grep || echo "无"
             exit 1
           fi
 
@@ -81,7 +77,6 @@ jobs:
           tar -xzf bore.tar.gz
           chmod +x bore
           
-          # 自动重连脚本
           cat > bore_loop.sh << 'EOF'
           #!/bin/bash
           while true; do
@@ -94,18 +89,19 @@ jobs:
           nohup ./bore_loop.sh > /dev/null 2>&1 &
           sleep 5
 
-      # ========== 5. 轻量看门狗 ==========
+      # ========== 5. 轻量看门狗（修复进程检测）==========
       - name: Lightweight watchdog
         run: |
           cat > simple_watchdog.sh << 'EOF'
           #!/bin/bash
           while true; do
-            # 只检查 VNC 进程
-            if ! pgrep -f "Xvnc.*:1" > /dev/null; then
+            # 修复：检测 Xtigervnc 或 Xvnc
+            if ! pgrep -f "Xtigervnc.*:1" > /dev/null && ! pgrep -f "Xvnc.*:1" > /dev/null; then
               echo "[$(date)] VNC 崩溃，重启中..." >> /tmp/vnc_restart.log
               vncserver -kill :1 2>/dev/null
               sleep 2
               rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
+              touch ~/.Xauthority
               vncserver :1 -geometry 1280x720 -depth 16 -localhost no
               sleep 3
             fi
@@ -129,8 +125,11 @@ jobs:
           echo "║  密码: github                                              ║"
           echo "╚════════════════════════════════════════════════════════════╝"
           echo ""
-          echo "💡 提示: 连接后你会看到 openbox 桌面 + xterm 终端"
+          echo "💡 VNC 客户端: TigerVNC, RealVNC, TightVNC 均可连接"
           echo "🔄 自动修复: VNC 崩溃后 15 秒内自动重启"
+          echo ""
+          echo "当前 VNC 状态："
+          vncserver -list 2>/dev/null || echo "无法获取列表"
 
       # ========== 7. tmate 后台 ==========
       - name: Start tmate
@@ -148,14 +147,18 @@ jobs:
           
           while true; do
             BORE_PORT=$(grep -oP 'listening at bore.pub:\K\d+' bore.log 2>/dev/null | tail -1)
-            VNC_OK=$(pgrep -f "Xvnc.*:1" > /dev/null && echo "✅" || echo "❌")
-            echo "[$(date '+%H:%M:%S')] VNC: $VNC_OK | bore.pub:${BORE_PORT:------}"
+            if pgrep -f "Xtigervnc.*:1" > /dev/null || pgrep -f "Xvnc.*:1" > /dev/null; then
+              VNC_STATUS="✅"
+            else
+              VNC_STATUS="❌"
+            fi
+            echo "[$(date '+%H:%M:%S')] VNC: $VNC_STATUS | bore.pub:${BORE_PORT:------}"
             sleep 30
           done
 
-      # ========== 9. 完整清理（工作流结束时自动执行）==========
+      # ========== 9. 完整清理 ==========
       - name: Cleanup everything
-        if: always()  # 无论成功/失败/取消都会执行
+        if: always()
         run: |
           echo "🧹 开始清理所有数据和缓存..."
           
@@ -166,17 +169,17 @@ jobs:
           pkill -f "openbox" 2>/dev/null || true
           pkill -f "tint2" 2>/dev/null || true
           
-          # 删除 VNC 临时文件
+          # 删除临时文件
           rm -rf /tmp/.X1* /tmp/.X11-unix/X1 2>/dev/null || true
-          rm -rf ~/.vnc/*.log ~/.vnc/*.pid 2>/dev/null || true
+          rm -rf ~/.vnc/*.log ~/.vnc/*.pid ~/.Xauthority 2>/dev/null || true
           
           # 删除 bore 和脚本
-          rm -f bore bore.tar.gz bore_loop.sh simple_watchdog.sh 2>/dev/null || true
+          rm -f bore bore.tar.gz bore_loop.sh simple_watchdog.sh bore.log 2>/dev/null || true
           
           # 清理 home 目录的临时文件
           rm -rf ~/.cache ~/.local/share/Trash 2>/dev/null || true
           
-          # 清理 apt 缓存（可选，省空间）
+          # 清理 apt 缓存
           sudo apt-get clean 2>/dev/null || true
           
           echo "✅ 清理完成，所有数据已删除"
